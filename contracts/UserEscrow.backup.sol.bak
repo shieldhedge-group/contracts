@@ -1,0 +1,766 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.30;
+
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "./interfaces/IEscrowFactory.sol";
+import "./interfaces/IWhitelistManager.sol";
+
+/* ========== USER ESCROW ========== */
+contract UserEscrow is ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+    using ECDSA for bytes32;
+
+    // Removed redundant mappings to save gas and storage
+    // Use IERC20(token).balanceOf(address(this)) directly instead
+
+    /* ========== EVENTS ========== */
+    event DepositedETH(address indexed from, uint256 amount);
+    event DepositedToken(
+        address indexed token,
+        address indexed from,
+        uint256 amount
+    );
+    event WithdrawnETH(address indexed to, uint256 amount);
+    event WithdrawnToken(
+        address indexed token,
+        address indexed to,
+        uint256 amount
+    );
+    event WithdrawnTokensBatch(
+        address indexed to,
+        address[] tokens,
+        uint256[] amounts
+    );
+    event ExecutedCall(
+        address indexed target,
+        uint256 value,
+        bytes data,
+        bytes result
+    );
+    event ExecutedMulticall(address indexed owner, uint256 calls);
+    event ExecutedWithSignatures(
+        address indexed target,
+        uint256 value,
+        bytes data,
+        address[] signers
+    );
+    event ApproverAdded(address indexed approver);
+    event ApproverRemoved(address indexed approver);
+    event OwnershipProposed(address indexed newOwner, uint256 availableAt);
+    event OwnershipCancelled(address indexed oldOwner);
+    event OwnershipAccepted(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+    event EscrowCreated(
+        address indexed owner,
+        address indexed poolAddress,
+        address escrowAddress
+    );
+
+    /* ========== STORAGE ========== */
+    address public owner; // This serves as depositor address
+    address public pendingOwner;
+    uint256 public pendingOwnerAvailableAt;
+    uint256 public immutable ownershipDelay;
+
+    IEscrowFactory public factory;
+    IWhitelistManager public whitelistManager;
+
+    // Pool association - each escrow is tied to a specific pool
+    address public immutable poolAddress;
+
+    // Multi-sig
+    address[] public approvers;
+    mapping(address => bool) public isApproverMap;
+    uint256 public threshold;
+
+    uint256 public nonce;
+    uint256 public immutable maxCalls;
+
+    // Safe self-call selectors whitelist
+    mapping(bytes4 => bool) public safeSelfCallSelectors;
+
+    // Configurable token addresses
+    address public usdcAddress;
+
+    // Authorized depositors (including EscrowManager if needed)
+    mapping(address => bool) public authorizedDepositors;
+
+    // Enhanced reentrancy protection
+    bool private _locked;
+
+
+
+    /* ========== MODIFIERS ========== */
+    modifier onlyOwner() {
+        require(msg.sender == owner, "UserEscrow: not owner");
+        _;
+    }
+    modifier notZero(address a) {
+        require(a != address(0), "UserEscrow: zero address");
+        _;
+    }
+
+    modifier noReentrant() {
+        require(!_locked, "UserEscrow: reentrant call");
+        _locked = true;
+        _;
+        _locked = false;
+    }
+    modifier onlyWhitelisted(address target) {
+        require(
+            whitelistManager.isWhitelistedWithCaller(target, address(this)),
+            "UserEscrow: target not whitelisted"
+        );
+        _;
+    }
+    modifier onlyAuthorizedDepositor() {
+        require(
+            msg.sender == owner ||
+            isApproverMap[msg.sender] ||
+            authorizedDepositors[msg.sender],
+            "UserEscrow: unauthorized depositor"
+        );
+        _;
+    }
+    modifier whenNotInEmergency() {
+        require(!factory.globalEmergencyPause(), "UserEscrow: global emergency pause");
+        require(!factory.pausedFunctions(msg.sig), "UserEscrow: function paused");
+        _;
+    }
+
+    /* ========== CONSTRUCTOR ========== */
+    constructor(
+        address _owner,
+        uint256 _ownershipDelay,
+        address factoryAddress,
+        address _poolAddress,
+        address[] memory _approvers,
+        uint256 _threshold,
+        uint256 _maxCalls,
+        address _usdcAddress,
+        address _whitelistManager
+    ) {
+        require(_owner != address(0), "UserEscrow: zero owner");
+        // Allow zero pool address for legacy escrows (backward compatibility)
+        require(
+            _threshold > 0 && _threshold <= _approvers.length,
+            "UserEscrow: invalid threshold"
+        );
+        require(_maxCalls > 0 && _maxCalls <= 20, "UserEscrow: invalid maxCalls");
+
+        require(_whitelistManager != address(0), "UserEscrow: zero whitelist manager");
+
+        owner = _owner;
+        ownershipDelay = _ownershipDelay;
+        factory = IEscrowFactory(factoryAddress);
+        whitelistManager = IWhitelistManager(_whitelistManager);
+        poolAddress = _poolAddress;
+        usdcAddress = _usdcAddress;
+
+        approvers = _approvers;
+        threshold = _threshold;
+        maxCalls = _maxCalls;
+
+        for (uint256 i = 0; i < _approvers.length; i++) {
+            require(_approvers[i] != address(0), "UserEscrow: zero approver");
+            require(!isApproverMap[_approvers[i]], "UserEscrow: duplicate approver");
+            isApproverMap[_approvers[i]] = true;
+        }
+
+        // Initialize safe self-call selectors
+        safeSelfCallSelectors[bytes4(keccak256("depositUSDC(uint256)"))] = true;
+        safeSelfCallSelectors[bytes4(keccak256("deposit(uint256)"))] = true;
+
+        // Emit event to track escrow creation per depositor+pool
+        emit EscrowCreated(_owner, _poolAddress, address(this));
+    }
+
+    /* ========== RECEIVE / FALLBACK ========== */
+    receive() external payable whenNotPaused onlyAuthorizedDepositor {
+        emit DepositedETH(msg.sender, msg.value);
+    }
+
+    /* ========== DEPOSIT / WITHDRAW ========== */
+
+    /// @notice Deposit USDC only - requires >1 USDC minimum
+    function depositUSDC(uint256 amount) external whenNotPaused onlyAuthorizedDepositor {
+        require(amount > 1 * 10**6, "UserEscrow: USDC amount must be >1 USDC");
+        require(usdcAddress != address(0), "UserEscrow: USDC not configured");
+        IERC20(usdcAddress).safeTransferFrom(msg.sender, address(this), amount);
+        emit DepositedToken(usdcAddress, msg.sender, amount);
+    }
+
+    /// @notice Main deposit function - requires exactly 0.001 ETH + >100 USDC
+    /// @param usdcAmount Amount of USDC to deposit (must be >100 USDC)
+    /// @dev msg.value must be exactly 0.001 ETH
+    function deposit(uint256 usdcAmount) external payable whenNotPaused onlyAuthorizedDepositor {
+        require(msg.value == 0.001 ether, "UserEscrow: must send exactly 0.001 ETH");
+        require(usdcAmount > 100 * 10**6, "UserEscrow: USDC amount must be >100 USDC");
+        require(usdcAddress != address(0), "UserEscrow: USDC not configured");
+
+        // Transfer USDC from sender
+        IERC20(usdcAddress).safeTransferFrom(msg.sender, address(this), usdcAmount);
+
+        emit DepositedETH(msg.sender, msg.value);
+        emit DepositedToken(usdcAddress, msg.sender, usdcAmount);
+    }
+
+
+    function withdrawETH(
+        address payable to
+    ) external nonReentrant noReentrant onlyOwner whenNotPaused notZero(to) whenNotInEmergency {
+        uint256 bal = address(this).balance;
+        require(bal > 0, "UserEscrow: no ETH");
+
+        // Enhanced security: Check if target is a contract and validate it
+        if (to.code.length > 0) {
+            require(_isValidWithdrawalTarget(to), "UserEscrow: invalid withdrawal target");
+        }
+
+        // Enhanced reentrancy protection: Use transfer() for external addresses, call() for verified targets
+        if (to.code.length == 0) {
+            // EOA - use transfer() which limits gas to 2300
+            to.transfer(bal);
+        } else {
+            // Contract - ensure it's whitelisted and use limited gas call
+            require(whitelistManager.isWhitelisted(to), "UserEscrow: contract not whitelisted");
+            (bool ok, ) = to.call{value: bal, gas: 5000}("");
+            require(ok, "UserEscrow: ETH transfer failed");
+        }
+        emit WithdrawnETH(to, bal);
+    }
+
+    function withdrawToken(
+        address token,
+        address to
+    ) external nonReentrant onlyOwner whenNotPaused notZero(token) notZero(to) whenNotInEmergency {
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        require(bal > 0, "UserEscrow: no token balance");
+
+        // Enhanced security: Validate token contract and withdrawal target
+        require(_isValidTokenContract(token), "UserEscrow: invalid token contract");
+        if (to.code.length > 0) {
+            require(_isValidWithdrawalTarget(to), "UserEscrow: invalid withdrawal target");
+        }
+
+        // Store balance before transfer to detect manipulation
+        uint256 balanceBefore = bal;
+        IERC20(token).safeTransfer(to, bal);
+
+        // Verify transfer completed correctly
+        uint256 balanceAfter = IERC20(token).balanceOf(address(this));
+        require(balanceBefore - balanceAfter == bal, "UserEscrow: transfer amount mismatch");
+
+        emit WithdrawnToken(token, to, bal);
+    }
+
+    function withdrawTokens(
+        address[] calldata tokens,
+        address to
+    ) external nonReentrant onlyOwner whenNotPaused notZero(to) {
+        require(tokens.length > 0, "UserEscrow: zero tokens");
+        uint256 len = tokens.length;
+        uint256[] memory amounts = new uint256[](len);
+        for (uint256 i = 0; i < len; i++) {
+            address token = tokens[i];
+            require(token != address(0), "UserEscrow: invalid token");
+            uint256 bal = IERC20(token).balanceOf(address(this));
+            amounts[i] = bal;
+            if (bal > 0) {
+                IERC20(token).safeTransfer(to, bal);
+                emit WithdrawnToken(token, to, bal);
+            }
+        }
+        emit WithdrawnTokensBatch(to, tokens, amounts);
+    }
+
+    /* ========== EXECUTE FUNCTIONS ========== */
+    function execute(
+        address target,
+        uint256 value,
+        bytes calldata data
+    )
+        external
+        payable
+        nonReentrant
+        onlyOwner
+        whenNotPaused
+        whenNotInEmergency
+        notZero(target)
+        onlyWhitelisted(target)
+        returns (bytes memory)
+    {
+        require(msg.value == value, "UserEscrow: msg.value mismatch");
+
+        // Execute external call with proper reentrancy protection
+        (bool ok, bytes memory result) = target.call{value: value}(data);
+
+        require(ok, "UserEscrow: call failed");
+        emit ExecutedCall(target, value, data, result);
+        return result;
+    }
+
+    function multicall(
+        address[] calldata targets,
+        uint256[] calldata values,
+        bytes[] calldata datas
+    )
+        external
+        payable
+        nonReentrant
+        onlyOwner
+        whenNotPaused
+        whenNotInEmergency
+        returns (bytes[] memory results)
+    {
+        require(targets.length <= maxCalls, "UserEscrow: too many calls");
+        require(targets.length <= 50, "UserEscrow: array too large"); // DoS protection
+        require(
+            targets.length == datas.length && datas.length == values.length,
+            "UserEscrow: length mismatch"
+        );
+
+        results = new bytes[](targets.length);
+        uint256 totalValue = 0;
+
+        for (uint256 i = 0; i < targets.length; i++) {
+            address target = targets[i];
+            require(target != address(0), "UserEscrow: zero target");
+
+            // Security: Ensure target is whitelisted with proper caller context
+            require(
+                whitelistManager.isWhitelistedWithCaller(target, address(this)),
+                "UserEscrow: target not whitelisted"
+            );
+
+            // Additional security: If calling self, only allow whitelisted safe functions
+            if (target == address(this)) {
+                bytes4 selector = bytes4(datas[i]);
+                require(
+                    safeSelfCallSelectors[selector],
+                    "UserEscrow: unsafe self-call"
+                );
+            }
+
+            totalValue = _safeAdd(totalValue, values[i]);
+        }
+        require(totalValue == msg.value, "UserEscrow: msg.value mismatch");
+
+
+        // Execute all calls with atomic success/failure
+        for (uint256 i = 0; i < targets.length; i++) {
+            // Gas limit check to prevent DoS
+            _checkGasLimit(50000); // Ensure minimum gas for remaining operations
+
+            (bool ok, bytes memory res) = targets[i].call{value: values[i]}(
+                datas[i]
+            );
+            require(ok, "UserEscrow: call failed"); // Atomic failure reverts all
+            results[i] = res;
+            emit ExecutedCall(targets[i], values[i], datas[i], res);
+        }
+
+        emit ExecutedMulticall(owner, targets.length);
+    }
+
+    /* ========== EXECUTE WITH OFF-CHAIN SIGNATURES ========== */
+    function executeWithSignatures(
+        address target,
+        uint256 value,
+        bytes calldata data,
+        bytes[] calldata signatures,
+        uint256 deadline
+    ) external payable nonReentrant whenNotPaused whenNotInEmergency notZero(target) onlyWhitelisted(target) {
+        require(
+            signatures.length >= threshold,
+            "UserEscrow: insufficient signatures"
+        );
+        require(block.timestamp <= deadline, "UserEscrow: signature expired");
+
+        // Compute message hash with secure replay protection and deadline
+        bytes32 rawHash = keccak256(
+            abi.encode(
+                address(this),
+                block.chainid,
+                target,
+                value,
+                keccak256(data), // Hash the data for additional uniqueness
+                nonce,
+                deadline // Use deadline for temporal uniqueness and replay protection
+            )
+        );
+        bytes32 messageHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", rawHash));
+
+        // Verify signatures BEFORE incrementing nonce (optimized for gas)
+        address[] memory signers = new address[](signatures.length);
+        uint256 validSigners = 0;
+
+        for (uint256 i = 0; i < signatures.length; i++) {
+            address signer = ECDSA.recover(messageHash, signatures[i]);
+
+            // Enhanced signature validation with anti-malleability protection
+            require(_validateSignature(messageHash, signatures[i], signer), "UserEscrow: invalid signature format");
+            require(isApproverMap[signer], "UserEscrow: invalid signer");
+            require(signer != address(0), "UserEscrow: recovered zero address");
+
+            // Optimized duplicate check - only check against valid signers so far
+            for (uint256 j = 0; j < validSigners; j++) {
+                require(signers[j] != signer, "UserEscrow: duplicate signer");
+            }
+
+            signers[validSigners] = signer;
+            validSigners++;
+        }
+
+        require(validSigners >= threshold, "UserEscrow: insufficient valid signatures");
+
+        // CRITICAL: Atomic balance check just before execution
+        require(
+            value <= address(this).balance,
+            "UserEscrow: insufficient balance at execution"
+        );
+
+        // Execute with proper error handling - reentrancy already protected by modifier
+        (bool ok, ) = target.call{value: value}(data);
+        require(ok, "UserEscrow: execution failed");
+
+        // increment nonce AFTER successful execution with overflow protection
+        require(nonce < type(uint256).max, "UserEscrow: nonce overflow");
+        unchecked {
+            nonce++;
+        }
+
+        emit ExecutedWithSignatures(target, value, data, signers);
+    }
+
+    /* ========== APPROVER MANAGEMENT ========== */
+    function addApprover(address newApprover) external onlyOwner notZero(newApprover) {
+        require(!isApproverMap[newApprover], "UserEscrow: already approver");
+        isApproverMap[newApprover] = true;
+        emit ApproverAdded(newApprover);
+    }
+
+    function removeApprover(address approver) external onlyOwner notZero(approver) {
+        require(isApproverMap[approver], "UserEscrow: not an approver");
+        isApproverMap[approver] = false;
+        emit ApproverRemoved(approver);
+    }
+
+    /* ========== OWNERSHIP / PAUSE ========== */
+    function proposeOwner(
+        address newOwner
+    ) external onlyOwner notZero(newOwner) {
+        require(newOwner != owner, "UserEscrow: already owner");
+        pendingOwner = newOwner;
+        pendingOwnerAvailableAt = block.timestamp + ownershipDelay;
+        emit OwnershipProposed(newOwner, pendingOwnerAvailableAt);
+    }
+
+    function cancelProposedOwner() external onlyOwner {
+        address old = pendingOwner;
+        pendingOwner = address(0);
+        pendingOwnerAvailableAt = 0;
+        emit OwnershipCancelled(old);
+    }
+
+    function acceptOwnership() external {
+        require(msg.sender == pendingOwner, "UserEscrow: not pendingOwner");
+        require(
+            block.timestamp >= pendingOwnerAvailableAt,
+            "UserEscrow: too early"
+        );
+
+        address previous = owner;
+        owner = pendingOwner;
+        pendingOwner = address(0);
+        pendingOwnerAvailableAt = 0;
+        emit OwnershipAccepted(previous, owner);
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /* ========== SAFE SELF-CALL MANAGEMENT ========== */
+    // Self-call selectors are now immutable for security - set only in constructor
+
+
+
+    function setAuthorizedDepositor(address depositor, bool authorized) external onlyOwner notZero(depositor) {
+        authorizedDepositors[depositor] = authorized;
+    }
+
+
+
+    /* ========== VIEW HELPERS ========== */
+    function balancesOf(
+        address[] calldata tokens
+    ) external view returns (uint256[] memory) {
+        uint256 len = tokens.length;
+        uint256[] memory bals = new uint256[](len);
+        for (uint256 i = 0; i < len; i++)
+            bals[i] = IERC20(tokens[i]).balanceOf(address(this));
+        return bals;
+    }
+
+    /// @notice Get USDC balance for this escrow
+    function getUSDCBalance() external view returns (uint256) {
+        if (usdcAddress == address(0)) return 0;
+        return IERC20(usdcAddress).balanceOf(address(this));
+    }
+
+    /// @notice Get configured USDC address
+    function getUSDCAddress() external view returns (address) {
+        return usdcAddress;
+    }
+
+
+
+
+
+    /**
+     * getTotalTVL
+     * Returns:
+     *  - totalETH : native ETH balance of this escrow
+     *  - totalTokens : array of token balances (in same order as `tokens` input).
+     *  - totalLP0 / totalLP1 : arrays read from lpBalance0 / lpBalance1 mapping.
+     */
+    function getTotalTVL(
+        address[] calldata tokens,
+        address[] calldata lpPools
+    )
+        external
+        view
+        returns (
+            uint256 totalETH,
+            uint256[] memory totalTokens,
+            uint256[] memory totalLP0,
+            uint256[] memory totalLP1
+        )
+    {
+        totalETH = address(this).balance;
+
+        uint256 numTokens = tokens.length;
+        uint256 numPools = lpPools.length;
+
+        totalTokens = new uint256[](numTokens);
+        totalLP0 = new uint256[](numPools);
+        totalLP1 = new uint256[](numPools);
+
+        // Read actual ERC20 balances for tokens (gas optimized)
+        unchecked {
+            for (uint256 i = 0; i < numTokens; ++i) {
+                address tok = tokens[i];
+                totalTokens[i] = tok == address(0) ? 0 : IERC20(tok).balanceOf(address(this));
+            }
+
+            // Read LP token balances (simplified since lpBalance mappings removed)
+            for (uint256 j = 0; j < numPools; ++j) {
+                address lp = lpPools[j];
+                totalLP0[j] = lp == address(0) ? 0 : IERC20(lp).balanceOf(address(this));
+                totalLP1[j] = 0; // Reserved for future use
+            }
+        }
+    }
+
+    /* ========== CIRCUIT BREAKER INTEGRATION ========== */
+
+    /// @notice Get emergency status from factory
+    /// @return globalPaused Global emergency state
+    /// @return localPaused Local contract pause state
+    /// @return executeBlocked Whether execute function is blocked
+    /// @return multicallBlocked Whether multicall function is blocked
+    /// @return signaturesBlocked Whether executeWithSignatures is blocked
+    function getEmergencyStatus() external view returns (
+        bool globalPaused,
+        bool localPaused,
+        bool executeBlocked,
+        bool multicallBlocked,
+        bool signaturesBlocked
+    ) {
+        globalPaused = factory.globalEmergencyPause();
+        localPaused = paused();
+
+        bytes4 executeSelector = bytes4(keccak256("execute(address,uint256,bytes)"));
+        bytes4 multicallSelector = bytes4(keccak256("multicall(address[],uint256[],bytes[])"));
+        bytes4 signaturesSelector = bytes4(keccak256("executeWithSignatures(address,uint256,bytes,bytes[],uint256)"));
+
+        executeBlocked = factory.pausedFunctions(executeSelector);
+        multicallBlocked = factory.pausedFunctions(multicallSelector);
+        signaturesBlocked = factory.pausedFunctions(signaturesSelector);
+    }
+
+    /* ========== DEFENSE IN DEPTH FEATURES ========== */
+
+    // Rate limiting storage
+    mapping(address => uint256) public lastOperationTime;
+    uint256 public constant OPERATION_COOLDOWN = 1 hours;
+    uint256 public constant LARGE_TX_THRESHOLD = 10000 * 10**6; // 10K USDC
+    uint256 public constant MAX_SINGLE_OPERATION = 100000 * 10**6; // 100K USDC
+
+    // Events for monitoring
+    event SuspiciousActivity(address indexed user, string reason, uint256 amount, address target);
+    event LargeTransaction(address indexed user, uint256 amount, address target, bytes data);
+    event RateLimitTriggered(address indexed user, uint256 lastOperation, uint256 cooldownUntil);
+
+    /// @notice Rate limiting modifier for critical operations
+    modifier rateLimited() {
+        uint256 cooldownEnd = lastOperationTime[msg.sender] + OPERATION_COOLDOWN;
+        if (block.timestamp < cooldownEnd) {
+            emit RateLimitTriggered(msg.sender, lastOperationTime[msg.sender], cooldownEnd);
+            require(false, "UserEscrow: operation too frequent");
+        }
+        lastOperationTime[msg.sender] = block.timestamp;
+        _;
+    }
+
+    /// @notice Enhanced validation for amounts
+    modifier validateAmount(uint256 amount) {
+        require(amount > 0, "UserEscrow: zero amount");
+        require(amount <= MAX_SINGLE_OPERATION, "UserEscrow: amount too large");
+        _;
+    }
+
+    /// @notice Detect and log suspicious activity
+    function _detectAndLogActivity(address target, uint256 value, bytes memory data) internal {
+        // Log large transactions
+        if (value > LARGE_TX_THRESHOLD) {
+            emit LargeTransaction(msg.sender, value, target, data);
+        }
+
+        // Detect suspicious patterns
+        bool suspicious = false;
+        string memory reason = "";
+
+        // Check for unusual target addresses
+        if (target.code.length == 0 && value > 0) {
+            suspicious = true;
+            reason = "ETH to EOA";
+        }
+
+        // Check for rapid large transactions
+        if (value > LARGE_TX_THRESHOLD && block.timestamp <= lastOperationTime[msg.sender] + 1 hours) {
+            suspicious = true;
+            reason = "Rapid large transaction";
+        }
+
+        if (suspicious) {
+            emit SuspiciousActivity(msg.sender, reason, value, target);
+        }
+    }
+
+    /// @notice Override execute with enhanced monitoring
+    function executeMonitored(
+        address target,
+        uint256 value,
+        bytes calldata data
+    )
+        external
+        payable
+        nonReentrant
+        onlyOwner
+        whenNotPaused
+        whenNotInEmergency
+        rateLimited
+        validateAmount(value)
+        notZero(target)
+        onlyWhitelisted(target)
+        returns (bytes memory)
+    {
+        require(msg.value == value, "UserEscrow: msg.value mismatch");
+
+        // Enhanced monitoring
+        _detectAndLogActivity(target, value, data);
+
+        // Execute external call with proper reentrancy protection
+        (bool ok, bytes memory result) = target.call{value: value}(data);
+
+        require(ok, "UserEscrow: call failed");
+        emit ExecutedCall(target, value, data, result);
+        return result;
+    }
+
+    /// @notice Emergency pause check - can be called by anyone to verify status
+    function isOperational() external view returns (bool) {
+        return !paused() && !factory.globalEmergencyPause();
+    }
+
+    /// @notice Check if specific function is operational
+    function isFunctionOperational(bytes4 selector) external view returns (bool) {
+        return !paused() && !factory.globalEmergencyPause() && !factory.pausedFunctions(selector);
+    }
+
+    /* ========== INTERNAL SECURITY FUNCTIONS ========== */
+
+    /// @notice Validate withdrawal target to prevent malicious contracts
+    function _isValidWithdrawalTarget(address target) internal view returns (bool) {
+        // Check if target is whitelisted for withdrawals
+        return whitelistManager.isWhitelisted(target) || target == owner;
+    }
+
+    /// @notice Validate token contract to prevent malicious tokens
+    function _isValidTokenContract(address token) internal view returns (bool) {
+        // Basic validation: must be a contract with proper ERC20 interface
+        if (token.code.length == 0) return false;
+
+        try IERC20(token).totalSupply() returns (uint256) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /// @notice Enhanced signature validation with additional security checks
+    function _validateSignature(
+        bytes32 messageHash,
+        bytes memory signature,
+        address expectedSigner
+    ) internal pure returns (bool) {
+        if (signature.length != 65) return false;
+
+        // Extract signature components
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+
+        assembly {
+            r := mload(add(signature, 32))
+            s := mload(add(signature, 64))
+            v := byte(0, mload(add(signature, 96)))
+        }
+
+        // Check for signature malleability (OpenZeppelin ECDSA protection)
+        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {
+            return false;
+        }
+
+        // Recover signer and validate
+        address recovered = ecrecover(messageHash, v, r, s);
+        return recovered == expectedSigner && recovered != address(0);
+    }
+
+    /// @notice Prevent integer overflow/underflow in value calculations
+    function _safeAdd(uint256 a, uint256 b) internal pure returns (uint256) {
+        require(a + b >= a, "UserEscrow: addition overflow");
+        return a + b;
+    }
+
+    function _safeSub(uint256 a, uint256 b) internal pure returns (uint256) {
+        require(b <= a, "UserEscrow: subtraction underflow");
+        return a - b;
+    }
+
+    /// @notice Gas limit check to prevent DoS attacks
+    function _checkGasLimit(uint256 requiredGas) internal view {
+        require(gasleft() >= requiredGas, "UserEscrow: insufficient gas");
+    }
+}

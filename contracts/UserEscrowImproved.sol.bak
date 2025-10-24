@@ -1,0 +1,395 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.30;
+
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "./interfaces/IEscrowFactory.sol";
+import "./interfaces/IWhitelistManager.sol";
+
+/* ========== USER ESCROW IMPROVED (Bot-Compatible) ========== */
+contract UserEscrowImproved is ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+    using ECDSA for bytes32;
+
+    /* ========== STATE VARIABLES ========== */
+    address public immutable factory;
+    address public owner;
+    address public pendingOwner;
+    uint256 public transferDeadline;
+    uint256 public constant OWNERSHIP_DELAY = 7 days;
+
+    // Multi-signature system
+    mapping(address => bool) public isApproverMap;
+    address[] public approvers;
+    uint256 public threshold;
+    uint256 public nonce;
+
+    // Bot automation compatibility
+    address public escrowManager; // Authorized EscrowManager for bot operations
+    bool public botAutomationEnabled = true;
+
+    // Balance tracking for LP tokens (future use)
+    mapping(address => uint256) public lpBalance0; // First token of LP pair
+    mapping(address => uint256) public lpBalance1; // Second token of LP pair
+
+    // Configurable token addresses
+    address public usdcAddress;
+    // Authorized depositors (including EscrowManager if needed)
+    mapping(address => bool) public authorizedDepositors;
+
+    /* ========== EVENTS ========== */
+    event DepositedETH(address indexed from, uint256 amount);
+    event DepositedToken(address indexed token, address indexed from, uint256 amount);
+    event WithdrawnETH(address indexed to, uint256 amount);
+    event WithdrawnToken(address indexed token, address indexed to, uint256 amount);
+    event WithdrawnTokensBatch(address indexed to, address[] tokens, uint256[] amounts);
+    event ExecutedCall(address indexed target, uint256 value, bytes data, bytes result);
+    event ExecutedMulticall(address indexed owner, uint256 calls);
+    event ExecutedWithSignatures(address indexed target, uint256 value, bytes data, address[] signers);
+    event ExecutedViaBotManager(address indexed manager, address indexed target, uint256 value, bytes data);
+
+    /* ========== MODIFIERS ========== */
+    modifier onlyOwner() {
+        require(msg.sender == owner, "UserEscrow: caller is not the owner");
+        _;
+    }
+
+    modifier notZero(address addr) {
+        require(addr != address(0), "UserEscrow: zero address");
+        _;
+    }
+
+    modifier onlyWhitelisted(address target) {
+        require(
+            IWhitelistManager(IEscrowFactory(factory).whitelistManager()).isWhitelisted(target),
+            "UserEscrow: target not whitelisted"
+        );
+        _;
+    }
+
+    modifier onlyAuthorizedDepositor() {
+        require(
+            msg.sender == owner ||
+            isApproverMap[msg.sender] ||
+            authorizedDepositors[msg.sender],
+            "UserEscrow: unauthorized depositor"
+        );
+        _;
+    }
+
+    /**
+     * @dev CRITICAL: Bot-compatible execution modifier
+     * Allows EscrowManager to bypass signature requirements for bot operations
+     */
+    modifier botCompatibleExecution() {
+        require(
+            msg.sender == owner || // Owner can always execute
+            (botAutomationEnabled &&
+             escrowManager != address(0) &&
+             msg.sender == escrowManager), // EscrowManager can execute bot operations
+            "UserEscrow: unauthorized execution"
+        );
+        _;
+    }
+
+    /* ========== CONSTRUCTOR ========== */
+    constructor(
+        address _factory,
+        address _owner,
+        address[] memory _approvers,
+        uint256 _threshold
+    ) {
+        require(_factory != address(0), "UserEscrow: factory cannot be zero");
+        require(_owner != address(0), "UserEscrow: owner cannot be zero");
+        require(_approvers.length > 0, "UserEscrow: need at least one approver");
+        require(_threshold > 0 && _threshold <= _approvers.length, "UserEscrow: invalid threshold");
+
+        factory = _factory;
+        owner = _owner;
+        threshold = _threshold;
+
+        // Initialize approvers
+        for (uint256 i = 0; i < _approvers.length; i++) {
+            address approver = _approvers[i];
+            require(approver != address(0), "UserEscrow: approver cannot be zero");
+            require(!isApproverMap[approver], "UserEscrow: duplicate approver");
+
+            isApproverMap[approver] = true;
+            approvers.push(approver);
+        }
+
+        // Set USDC address from factory
+        usdcAddress = IEscrowFactory(_factory).getUSDCAddress();
+
+        // CRITICAL: Set EscrowManager from factory for bot compatibility
+        try IEscrowFactory(_factory).escrowManager() returns (address manager) {
+            if (manager != address(0)) {
+                escrowManager = manager;
+                authorizedDepositors[manager] = true; // Auto-authorize EscrowManager
+            }
+        } catch {
+            // If factory doesn't have escrowManager method, continue without it
+        }
+    }
+
+    /* ========== CORE EXECUTION FUNCTIONS ========== */
+
+    /**
+     * @notice Execute external call (owner only)
+     * @param target Target contract address
+     * @param value ETH value to send
+     * @param data Call data
+     */
+    function execute(
+        address target,
+        uint256 value,
+        bytes calldata data
+    )
+        external
+        payable
+        nonReentrant
+        onlyOwner
+        whenNotPaused
+        notZero(target)
+        onlyWhitelisted(target)
+        returns (bytes memory)
+    {
+        require(msg.value == value, "UserEscrow: msg.value mismatch");
+        require(value <= address(this).balance, "UserEscrow: insufficient balance");
+
+        // Execute external call with proper reentrancy protection
+        (bool ok, bytes memory result) = target.call{value: value}(data);
+        require(ok, "UserEscrow: call failed");
+
+        nonce++; // Increment nonce for any state-changing operation
+        emit ExecutedCall(target, value, data, result);
+        return result;
+    }
+
+    /**
+     * @notice IMPROVED: Bot-compatible execution with EscrowManager bypass
+     * @param target Target contract address
+     * @param value ETH value to send
+     * @param data Call data
+     * @param signatures Signatures (can be empty for EscrowManager calls)
+     * @param deadline Signature deadline
+     */
+    function executeWithSignatures(
+        address target,
+        uint256 value,
+        bytes calldata data,
+        bytes[] calldata signatures,
+        uint256 deadline
+    ) external payable nonReentrant notZero(target) onlyWhitelisted(target) {
+
+        require(block.timestamp <= deadline, "UserEscrow: signature expired");
+        require(value <= address(this).balance, "UserEscrow: insufficient balance");
+
+        // CRITICAL: EscrowManager bypass for bot operations
+        if (botAutomationEnabled &&
+            escrowManager != address(0) &&
+            msg.sender == escrowManager) {
+
+            // EscrowManager can execute without signatures (bot automation)
+            (bool ok, bytes memory result) = target.call{value: value}(data);
+            require(ok, "UserEscrow: bot execution failed");
+
+            nonce++; // Increment nonce
+            emit ExecutedViaBotManager(msg.sender, target, value, data);
+            return;
+        }
+
+        // Standard signature validation for non-EscrowManager calls
+        require(signatures.length >= threshold, "UserEscrow: insufficient signatures");
+
+        // Compute message hash with secure replay protection and deadline
+        bytes32 rawHash = keccak256(
+            abi.encode(
+                address(this),
+                block.chainid,
+                target,
+                value,
+                keccak256(data),
+                nonce,
+                deadline
+            )
+        );
+        bytes32 messageHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", rawHash));
+
+        // Verify signatures
+        address[] memory signers = new address[](signatures.length);
+        uint256 validSigners = 0;
+        for (uint256 i = 0; i < signatures.length; i++) {
+            address signer = ECDSA.recover(messageHash, signatures[i]);
+            require(isApproverMap[signer], "UserEscrow: invalid signer");
+
+            // Check for duplicates
+            for (uint256 j = 0; j < validSigners; j++) {
+                require(signers[j] != signer, "UserEscrow: duplicate signer");
+            }
+            signers[validSigners] = signer;
+            validSigners++;
+        }
+        require(validSigners >= threshold, "UserEscrow: insufficient valid signatures");
+
+        // Execute the call
+        (bool ok, bytes memory result) = target.call{value: value}(data);
+        require(ok, "UserEscrow: signature execution failed");
+
+        nonce++;
+        emit ExecutedWithSignatures(target, value, data, signers);
+    }
+
+    /**
+     * @notice Bot-compatible direct execution (EscrowManager only)
+     * @dev This function allows EscrowManager to execute operations without signatures
+     */
+    function executeBotOperation(
+        address target,
+        uint256 value,
+        bytes calldata data
+    )
+        external
+        payable
+        nonReentrant
+        botCompatibleExecution
+        notZero(target)
+        onlyWhitelisted(target)
+        returns (bytes memory)
+    {
+        require(msg.value == value, "UserEscrow: msg.value mismatch");
+        require(value <= address(this).balance, "UserEscrow: insufficient balance");
+
+        // Execute external call
+        (bool ok, bytes memory result) = target.call{value: value}(data);
+        require(ok, "UserEscrow: bot operation failed");
+
+        nonce++; // Increment nonce
+        emit ExecutedViaBotManager(msg.sender, target, value, data);
+        return result;
+    }
+
+    /* ========== BOT AUTOMATION MANAGEMENT ========== */
+
+    /**
+     * @notice Set EscrowManager address (owner only)
+     * @param _escrowManager New EscrowManager address
+     */
+    function setEscrowManager(address _escrowManager) external onlyOwner {
+        escrowManager = _escrowManager;
+        if (_escrowManager != address(0)) {
+            authorizedDepositors[_escrowManager] = true;
+        }
+    }
+
+    /**
+     * @notice Enable/disable bot automation (owner only)
+     * @param enabled Whether bot automation is enabled
+     */
+    function setBotAutomationEnabled(bool enabled) external onlyOwner {
+        botAutomationEnabled = enabled;
+    }
+
+    /* ========== DEPOSIT FUNCTIONS ========== */
+    receive() external payable onlyAuthorizedDepositor {
+        emit DepositedETH(msg.sender, msg.value);
+    }
+
+    function depositETH() external payable onlyAuthorizedDepositor {
+        emit DepositedETH(msg.sender, msg.value);
+    }
+
+    function depositToken(address token, uint256 amount) external onlyAuthorizedDepositor notZero(token) {
+        require(amount > 0, "UserEscrow: amount must be positive");
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        emit DepositedToken(token, msg.sender, amount);
+    }
+
+    /* ========== WITHDRAWAL FUNCTIONS ========== */
+
+    function withdrawETH(address payable to, uint256 amount) external onlyOwner whenNotPaused {
+        require(amount <= address(this).balance, "UserEscrow: insufficient ETH balance");
+        to.transfer(amount);
+        emit WithdrawnETH(to, amount);
+    }
+
+    function withdrawToken(address token, address to, uint256 amount) external onlyOwner whenNotPaused notZero(token) notZero(to) {
+        require(amount > 0, "UserEscrow: amount must be positive");
+        require(amount <= IERC20(token).balanceOf(address(this)), "UserEscrow: insufficient token balance");
+        IERC20(token).safeTransfer(to, amount);
+        emit WithdrawnToken(token, to, amount);
+    }
+
+    function withdrawTokensBatch(
+        address[] calldata tokens,
+        address to,
+        uint256[] calldata amounts
+    ) external onlyOwner whenNotPaused notZero(to) {
+        require(tokens.length == amounts.length, "UserEscrow: array length mismatch");
+        require(tokens.length > 0, "UserEscrow: empty arrays");
+
+        for (uint256 i = 0; i < tokens.length; i++) {
+            require(tokens[i] != address(0), "UserEscrow: token cannot be zero");
+            require(amounts[i] > 0, "UserEscrow: amount must be positive");
+            require(amounts[i] <= IERC20(tokens[i]).balanceOf(address(this)), "UserEscrow: insufficient token balance");
+            IERC20(tokens[i]).safeTransfer(to, amounts[i]);
+        }
+
+        emit WithdrawnTokensBatch(to, tokens, amounts);
+    }
+
+    /* ========== VIEW FUNCTIONS ========== */
+
+    function getETHBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+
+    function getTokenBalance(address token) external view returns (uint256) {
+        return IERC20(token).balanceOf(address(this));
+    }
+
+    function getApprovers() external view returns (address[] memory) {
+        return approvers;
+    }
+
+    function getApproverCount() external view returns (uint256) {
+        return approvers.length;
+    }
+
+    /* ========== OWNER MANAGEMENT ========== */
+
+    function proposeOwnershipTransfer(address newOwner) external onlyOwner notZero(newOwner) {
+        pendingOwner = newOwner;
+        transferDeadline = block.timestamp + OWNERSHIP_DELAY;
+    }
+
+    function acceptOwnership() external {
+        require(msg.sender == pendingOwner, "UserEscrow: caller is not the pending owner");
+        require(block.timestamp >= transferDeadline, "UserEscrow: transfer still timelocked");
+        owner = pendingOwner;
+        pendingOwner = address(0);
+        transferDeadline = 0;
+    }
+
+    function cancelOwnershipTransfer() external onlyOwner {
+        pendingOwner = address(0);
+        transferDeadline = 0;
+    }
+
+    /* ========== EMERGENCY FUNCTIONS ========== */
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function setAuthorizedDepositor(address depositor, bool authorized) external onlyOwner notZero(depositor) {
+        authorizedDepositors[depositor] = authorized;
+    }
+}

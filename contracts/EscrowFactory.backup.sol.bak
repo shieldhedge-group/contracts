@@ -1,0 +1,244 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.30;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "./UserEscrow.sol";
+import "./interfaces/IEscrowRegistry.sol";
+import "./interfaces/IWhitelistManager.sol";
+contract EscrowFactory is Ownable, Pausable {
+
+    IEscrowRegistry public escrowRegistry;
+    IWhitelistManager public whitelistManager;
+    uint256 public immutable ownershipDelay;
+
+    // Bot address that gets automatically added as approver
+    address public botAddress;
+
+    // Base network USDC address
+    address public constant USDC_BASE = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
+
+    event EscrowCreated(address indexed user, address indexed escrow);
+    event EscrowCreatedForPool(address indexed user, address indexed pool, address indexed escrow);
+    event EscrowRegistryUpdated(address indexed oldRegistry, address indexed newRegistry);
+    event BotAddressUpdated(address indexed oldBot, address indexed newBot);
+
+    constructor(uint256 _ownershipDelay, address _escrowRegistry, address _whitelistManager, address _botAddress) {
+        require(_escrowRegistry != address(0), "EscrowFactory: zero registry");
+        require(_whitelistManager != address(0), "EscrowFactory: zero whitelist manager");
+        require(_botAddress != address(0), "EscrowFactory: zero bot address");
+        ownershipDelay = _ownershipDelay;
+        escrowRegistry = IEscrowRegistry(_escrowRegistry);
+        whitelistManager = IWhitelistManager(_whitelistManager);
+        botAddress = _botAddress;
+        emergencyAdmin = _botAddress; // Set bot as initial emergency admin
+    }
+
+    function setEscrowRegistry(address _escrowRegistry) external onlyOwner {
+        require(_escrowRegistry != address(0), "EscrowFactory: zero registry");
+        address oldRegistry = address(escrowRegistry);
+        escrowRegistry = IEscrowRegistry(_escrowRegistry);
+        emit EscrowRegistryUpdated(oldRegistry, _escrowRegistry);
+    }
+
+    function setBotAddress(address _botAddress) external onlyOwner {
+        require(_botAddress != address(0), "EscrowFactory: zero bot address");
+        address oldBot = botAddress;
+        botAddress = _botAddress;
+        emit BotAddressUpdated(oldBot, _botAddress);
+    }
+
+    function createEscrow(
+        address poolAddress,
+        address[] memory approvers,
+        uint256 threshold,
+        uint256 maxCalls
+    ) external whenNotPaused returns (address) {
+        require(poolAddress != address(0), "EscrowFactory: zero pool address");
+        require(!escrowRegistry.hasEscrowForPool(msg.sender, poolAddress), "EscrowFactory: pool escrow exists");
+
+        // Automatically add bot address to approvers if not already included
+        address[] memory finalApprovers = approvers;
+        bool botIncluded = false;
+
+        // Check if bot is already in the approvers list
+        for (uint256 i = 0; i < approvers.length; i++) {
+            if (approvers[i] == botAddress) {
+                botIncluded = true;
+                break;
+            }
+        }
+
+        // If bot not included, create new array with bot added
+        if (!botIncluded && botAddress != address(0)) {
+            finalApprovers = new address[](approvers.length + 1);
+            for (uint256 i = 0; i < approvers.length; i++) {
+                finalApprovers[i] = approvers[i];
+            }
+            finalApprovers[approvers.length] = botAddress;
+        }
+
+        UserEscrow escrow = new UserEscrow(
+            msg.sender,         // _owner
+            poolAddress,        // _poolAddress
+            finalApprovers,     // _approvers
+            threshold,          // _threshold
+            maxCalls,           // _maxCalls
+            ownershipDelay,     // _ownershipDelay
+            address(this),      // _factory
+            address(whitelistManager), // _whitelist
+            getNetworkUSDC()    // _usdc
+        );
+
+        address escrowAddr = address(escrow);
+        escrowRegistry.registerEscrow(escrowAddr, msg.sender, poolAddress);
+
+        emit EscrowCreatedForPool(msg.sender, poolAddress, escrowAddr);
+        return escrowAddr;
+    }
+
+
+    /// @notice Get the appropriate USDC address for current network
+    function getNetworkUSDC() public pure returns (address) {
+        // For now, always return Base USDC since we're Base-focused
+        return USDC_BASE;
+    }
+
+    function getTotalEscrowCount() external view returns (uint256) {
+        return escrowRegistry.getTotalEscrowCount();
+    }
+
+    function isRegisteredEscrow(address escrow) external view returns (bool) {
+        return escrowRegistry.isRegisteredEscrow(escrow);
+    }
+
+    function getEscrowForPool(address user, address poolAddress) external view returns (address) {
+        return escrowRegistry.getEscrowForPool(user, poolAddress);
+    }
+
+    function hasEscrowForPool(address user, address poolAddress) external view returns (bool) {
+        return escrowRegistry.hasEscrowForPool(user, poolAddress);
+    }
+
+    function getLegacyEscrow(address user) external view returns (address) {
+        return escrowRegistry.getLegacyEscrow(user);
+    }
+
+    /* ========== PAUSE/UNPAUSE ========== */
+
+    /// @notice Pause escrow creation
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Unpause escrow creation
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /* ========== CIRCUIT BREAKER EMERGENCY CONTROLS ========== */
+
+    // Global emergency pause state
+    bool public globalEmergencyPause;
+
+    // Function-specific pause control (function selector => paused)
+    mapping(bytes4 => bool) public pausedFunctions;
+
+    // Emergency admin with limited emergency powers
+    address public emergencyAdmin;
+
+    // Events for transparency
+    event GlobalEmergencySet(bool indexed paused, address indexed admin);
+    event FunctionPaused(bytes4 indexed selector, bool indexed paused, address indexed admin);
+    event EmergencyAdminUpdated(address indexed oldAdmin, address indexed newAdmin);
+
+    // Emergency response modifiers
+    modifier onlyEmergencyControl() {
+        require(
+            msg.sender == owner() || msg.sender == emergencyAdmin,
+            "EscrowFactory: not emergency control"
+        );
+        _;
+    }
+
+    /// @notice Set global emergency pause state
+    /// @dev Can be called by owner or emergency admin for rapid response
+    function setGlobalEmergency(bool _paused) external onlyEmergencyControl {
+        globalEmergencyPause = _paused;
+        emit GlobalEmergencySet(_paused, msg.sender);
+    }
+
+    /// @notice Pause/unpause specific functions by selector
+    /// @param selector Function selector to control
+    /// @param _paused Whether to pause the function
+    function pauseFunction(bytes4 selector, bool _paused) external onlyEmergencyControl {
+        pausedFunctions[selector] = _paused;
+        emit FunctionPaused(selector, _paused, msg.sender);
+    }
+
+    /// @notice Batch pause multiple functions
+    /// @param selectors Array of function selectors
+    /// @param _paused Whether to pause the functions
+    function pauseFunctions(bytes4[] calldata selectors, bool _paused) external onlyEmergencyControl {
+        for (uint256 i = 0; i < selectors.length; i++) {
+            pausedFunctions[selectors[i]] = _paused;
+            emit FunctionPaused(selectors[i], _paused, msg.sender);
+        }
+    }
+
+    /// @notice Set emergency admin address
+    /// @dev Only owner can set emergency admin
+    function setEmergencyAdmin(address _emergencyAdmin) external onlyOwner {
+        address oldAdmin = emergencyAdmin;
+        emergencyAdmin = _emergencyAdmin;
+        emit EmergencyAdminUpdated(oldAdmin, _emergencyAdmin);
+    }
+
+    /// @notice Check if a function is currently paused
+    /// @param selector Function selector to check
+    /// @return Whether the function is paused
+    function isFunctionPaused(bytes4 selector) external view returns (bool) {
+        return pausedFunctions[selector];
+    }
+
+    /// @notice Get comprehensive emergency status
+    /// @return globalPaused Global emergency state
+    /// @return factoryPaused Factory creation pause state
+    /// @return admin Current emergency admin
+    function getEmergencyStatus() external view returns (
+        bool globalPaused,
+        bool factoryPaused,
+        address admin
+    ) {
+        return (globalEmergencyPause, paused(), emergencyAdmin);
+    }
+
+    /// @notice Emergency function to pause critical operations
+    /// @dev Pauses execute, multicall, and executeWithSignatures
+    function emergencyPauseCriticalFunctions() external onlyEmergencyControl {
+        bytes4[3] memory criticalSelectors = [
+            bytes4(keccak256("execute(address,uint256,bytes)")),
+            bytes4(keccak256("multicall(address[],uint256[],bytes[])")),
+            bytes4(keccak256("executeWithSignatures(address,uint256,bytes,bytes[],uint256)"))
+        ];
+
+        for (uint256 i = 0; i < criticalSelectors.length; i++) {
+            pausedFunctions[criticalSelectors[i]] = true;
+            emit FunctionPaused(criticalSelectors[i], true, msg.sender);
+        }
+    }
+
+    /// @notice Emergency function to unpause critical operations
+    function emergencyUnpauseCriticalFunctions() external onlyEmergencyControl {
+        bytes4[3] memory criticalSelectors = [
+            bytes4(keccak256("execute(address,uint256,bytes)")),
+            bytes4(keccak256("multicall(address[],uint256[],bytes[])")),
+            bytes4(keccak256("executeWithSignatures(address,uint256,bytes,bytes[],uint256)"))
+        ];
+
+        for (uint256 i = 0; i < criticalSelectors.length; i++) {
+            pausedFunctions[criticalSelectors[i]] = false;
+            emit FunctionPaused(criticalSelectors[i], false, msg.sender);
+        }
+    }
+}

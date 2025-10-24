@@ -1,0 +1,411 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "./UserEscrow.sol";
+import "./interfaces/IEscrowFactory.sol";
+import "./interfaces/IEscrowRegistry.sol";
+
+/// @title EscrowManager (Improved Debug Version)
+/// @notice TVL aggregation + trigger / batch trigger for registered escrows. Enhanced debugging.
+contract EscrowManagerImproved is ReentrancyGuard {
+    IEscrowFactory public factory;
+    IEscrowRegistry public escrowRegistry;
+    address public owner;
+
+    // Bot automation system
+    mapping(address => bool) public authorizedBots;
+    mapping(address => mapping(address => bool)) public userBotPermissions; // user => bot => allowed
+    mapping(address => uint256) public botNonces; // prevent replay attacks
+    uint256 public maxBotValue = 1 ether; // maximum ETH value bots can handle per transaction
+    bool public botSystemEnabled = true;
+
+    event EscrowTriggered(address indexed escrow, address indexed target, uint256 value);
+    event BatchEscrowTriggered(uint256 count);
+    event BotAuthorized(address indexed bot, bool authorized);
+    event BotPermissionGranted(address indexed user, address indexed bot, bool granted);
+    event BotTriggered(address indexed bot, address indexed escrow, address indexed target);
+    event BotOperationDebug(
+        address indexed bot,
+        address indexed escrow,
+        bool systemEnabled,
+        bool botAuthorized,
+        bool userPermission,
+        uint256 expectedNonce,
+        uint256 providedNonce,
+        string stage
+    );
+
+    struct TVLData {
+        uint256 ethBal;
+        uint256[] tokBals;
+        uint256[] lp0;
+        uint256[] lp1;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "EscrowManager: caller is not the owner");
+        _;
+    }
+
+    modifier onlyAuthorizedBot() {
+        // Enhanced debugging: Emit event with all authorization states
+        bool systemEnabled = botSystemEnabled;
+        bool botAuthorized = authorizedBots[msg.sender];
+
+        emit BotOperationDebug(
+            msg.sender,
+            address(0),
+            systemEnabled,
+            botAuthorized,
+            false, // userPermission checked later
+            botNonces[msg.sender],
+            0, // providedNonce checked later
+            "authorization_check"
+        );
+
+        require(systemEnabled,
+            string.concat(
+                "EscrowManager: bot system disabled - enable with setBotSystemEnabled(true). ",
+                "Current bot: ", addressToString(msg.sender)
+            )
+        );
+
+        require(botAuthorized,
+            string.concat(
+                "EscrowManager: unauthorized bot - authorize with setAuthorizedBot(",
+                addressToString(msg.sender),
+                ", true). Current authorization: false"
+            )
+        );
+        _;
+    }
+
+    modifier botValueLimit(uint256 value) {
+        require(value <= maxBotValue,
+            string.concat(
+                "EscrowManager: value exceeds bot limit. ",
+                "Provided: ", uint256ToString(value),
+                " wei, Max: ", uint256ToString(maxBotValue),
+                " wei (", uint256ToString(maxBotValue / 1 ether), " ETH)"
+            )
+        );
+        _;
+    }
+
+    constructor(address factoryAddr, address registryAddr, address botAddr) {
+        require(factoryAddr != address(0), "EscrowManager: factory address cannot be zero");
+        require(registryAddr != address(0), "EscrowManager: registry address cannot be zero");
+        factory = IEscrowFactory(factoryAddr);
+        escrowRegistry = IEscrowRegistry(registryAddr);
+        owner = msg.sender;
+
+        // Auto-authorize bot during deployment if provided
+        if (botAddr != address(0)) {
+            authorizedBots[botAddr] = true;
+            emit BotAuthorized(botAddr, true);
+        }
+    }
+
+    /// ========== Bot Automation Functions ==========
+    /// @notice bot automated trigger for rebalancing LP, swaps, and DeFi operations
+    function botTriggerEscrow(
+        address escrowAddr,
+        address target,
+        uint256 value,
+        bytes calldata data,
+        bytes[] calldata signatures,
+        uint256 deadline,
+        uint256 nonce
+    ) external payable nonReentrant onlyAuthorizedBot botValueLimit(value) {
+        require(escrowAddr != address(0), "EscrowManager: escrow address cannot be zero");
+        require(escrowRegistry.isRegisteredEscrow(escrowAddr),
+            string.concat(
+                "EscrowManager: escrow is not registered in registry. ",
+                "Escrow: ", addressToString(escrowAddr)
+            )
+        );
+
+        // Get escrow owner
+        address escrowOwner = UserEscrow(payable(escrowAddr)).owner();
+
+        // CRITICAL: Check user granted permission to this bot
+        bool hasPermission = userBotPermissions[escrowOwner][msg.sender];
+
+        // Enhanced debugging: Emit event with all states before validation
+        emit BotOperationDebug(
+            msg.sender,
+            escrowAddr,
+            true, // already checked in modifier
+            true, // already checked in modifier
+            hasPermission,
+            botNonces[msg.sender],
+            nonce,
+            "permission_and_nonce_check"
+        );
+
+        require(hasPermission,
+            string.concat(
+                "EscrowManager: escrow owner has not granted permission to this bot. ",
+                "Owner: ", addressToString(escrowOwner),
+                ", Bot: ", addressToString(msg.sender),
+                ", Permission: false. Call grantBotPermission() from owner account."
+            )
+        );
+
+        // Prevent replay attacks with detailed error
+        uint256 currentNonce = botNonces[msg.sender];
+        require(currentNonce == nonce,
+            string.concat(
+                "EscrowManager: invalid nonce - expected current bot nonce. ",
+                "Expected: ", uint256ToString(currentNonce),
+                ", Provided: ", uint256ToString(nonce),
+                ", Bot: ", addressToString(msg.sender)
+            )
+        );
+
+        botNonces[msg.sender]++;
+
+        // CRITICAL: Validate msg.value matches execution value
+        require(msg.value == value,
+            string.concat(
+                "EscrowManager: msg.value does not match execution value. ",
+                "msg.value: ", uint256ToString(msg.value),
+                ", execution value: ", uint256ToString(value)
+            )
+        );
+
+        // Execute the operation via escrow's signature system
+        UserEscrow(payable(escrowAddr)).executeWithSignatures{value: value}(
+            target, value, data, signatures, deadline
+        );
+
+        emit EscrowTriggered(escrowAddr, target, value);
+        emit BotTriggered(msg.sender, escrowAddr, target);
+    }
+
+    /// @notice bot automated trigger for multiple escrows (batch rebalancing)
+    function botBatchTrigger(
+        address[] calldata escrowAddrs,
+        address[] calldata targets,
+        uint256[] calldata values,
+        bytes[] calldata datas,
+        bytes[][] calldata signaturesList,
+        uint256[] calldata deadlines,
+        uint256 nonce
+    ) external payable nonReentrant onlyAuthorizedBot {
+        uint256 n = escrowAddrs.length;
+        require(n > 0, "EscrowManager: cannot process empty escrow arrays");
+        require(n <= 5, "EscrowManager: batch size exceeds maximum of 5 escrows"); // Limit bot batch size
+        require(
+            n == targets.length &&
+            n == values.length &&
+            n == datas.length &&
+            n == signaturesList.length &&
+            n == deadlines.length,
+            string.concat(
+                "EscrowManager: all input arrays must have the same length. ",
+                "escrowAddrs: ", uint256ToString(escrowAddrs.length),
+                ", targets: ", uint256ToString(targets.length),
+                ", values: ", uint256ToString(values.length),
+                ", datas: ", uint256ToString(datas.length),
+                ", signaturesList: ", uint256ToString(signaturesList.length),
+                ", deadlines: ", uint256ToString(deadlines.length)
+            )
+        );
+
+        // Prevent replay attacks with detailed error
+        uint256 currentNonce = botNonces[msg.sender];
+        require(currentNonce == nonce,
+            string.concat(
+                "EscrowManager: invalid nonce for batch operation. ",
+                "Expected: ", uint256ToString(currentNonce),
+                ", Provided: ", uint256ToString(nonce),
+                ", Bot: ", addressToString(msg.sender)
+            )
+        );
+
+        botNonces[msg.sender]++;
+
+        // Calculate and validate total value
+        uint256 totalValue = 0;
+        for (uint256 i = 0; i < n; ++i) {
+            totalValue += values[i];
+        }
+
+        require(msg.value == totalValue,
+            string.concat(
+                "EscrowManager: msg.value does not match total execution value. ",
+                "msg.value: ", uint256ToString(msg.value),
+                ", calculated total: ", uint256ToString(totalValue)
+            )
+        );
+
+        // Execute operations on each escrow
+        for (uint256 i = 0; i < n; ++i) {
+            address currentEscrow = escrowAddrs[i];
+
+            require(currentEscrow != address(0),
+                string.concat(
+                    "EscrowManager: escrow address cannot be zero at index ",
+                    uint256ToString(i)
+                )
+            );
+
+            require(escrowRegistry.isRegisteredEscrow(currentEscrow),
+                string.concat(
+                    "EscrowManager: escrow at index ", uint256ToString(i),
+                    " is not registered. Address: ", addressToString(currentEscrow)
+                )
+            );
+
+            // Get escrow owner and check permissions
+            address escrowOwner = UserEscrow(payable(currentEscrow)).owner();
+            bool hasPermission = userBotPermissions[escrowOwner][msg.sender];
+
+            require(hasPermission,
+                string.concat(
+                    "EscrowManager: escrow owner at index ", uint256ToString(i),
+                    " has not granted permission to this bot. ",
+                    "Owner: ", addressToString(escrowOwner),
+                    ", Escrow: ", addressToString(currentEscrow),
+                    ", Bot: ", addressToString(msg.sender)
+                )
+            );
+
+            // Validate value doesn't exceed per-operation limit
+            require(values[i] <= maxBotValue,
+                string.concat(
+                    "EscrowManager: value at index ", uint256ToString(i),
+                    " exceeds bot limit. Value: ", uint256ToString(values[i]),
+                    ", Max: ", uint256ToString(maxBotValue)
+                )
+            );
+
+            // Execute the operation
+            UserEscrow(payable(currentEscrow)).executeWithSignatures{value: values[i]}(
+                targets[i], values[i], datas[i], signaturesList[i], deadlines[i]
+            );
+
+            emit EscrowTriggered(currentEscrow, targets[i], values[i]);
+            emit BotTriggered(msg.sender, currentEscrow, targets[i]);
+        }
+
+        emit BatchEscrowTriggered(n);
+    }
+
+    /// ========== Bot Authorization Management ==========
+    /// @notice authorize/deauthorize bots (only owner)
+    function setAuthorizedBot(address bot, bool authorized) external onlyOwner {
+        require(bot != address(0), "EscrowManager: zero bot address");
+        authorizedBots[bot] = authorized;
+        emit BotAuthorized(bot, authorized);
+    }
+
+    /// @notice enable/disable bot system (only owner)
+    function setBotSystemEnabled(bool enabled) external onlyOwner {
+        botSystemEnabled = enabled;
+    }
+
+    /// @notice set maximum ETH value bots can handle per transaction (only owner)
+    function setMaxBotValue(uint256 newMaxValue) external onlyOwner {
+        maxBotValue = newMaxValue;
+    }
+
+    /// @notice grant/revoke bot permission for your escrows
+    function grantBotPermission(address bot, bool granted) external {
+        require(bot != address(0), "EscrowManager: zero bot address");
+        userBotPermissions[msg.sender][bot] = granted;
+        emit BotPermissionGranted(msg.sender, bot, granted);
+    }
+
+    /// ========== View Functions ==========
+    /// @notice check if user has granted permission to a bot
+    function hasUserGrantedBotPermission(address user, address bot) external view returns (bool) {
+        return userBotPermissions[user][bot];
+    }
+
+    /// @notice get bot's current nonce
+    function getBotNonce(address bot) external view returns (uint256) {
+        return botNonces[bot];
+    }
+
+    /// @notice get detailed bot status for debugging
+    function getBotStatus(address bot, address escrow) external view returns (
+        bool systemEnabled,
+        bool botAuthorized,
+        bool userPermission,
+        uint256 currentNonce,
+        uint256 maxValue,
+        address escrowOwner
+    ) {
+        systemEnabled = botSystemEnabled;
+        botAuthorized = authorizedBots[bot];
+        currentNonce = botNonces[bot];
+        maxValue = maxBotValue;
+
+        if (escrow != address(0)) {
+            try UserEscrow(payable(escrow)).owner() returns (address owner) {
+                escrowOwner = owner;
+                userPermission = userBotPermissions[owner][bot];
+            } catch {
+                escrowOwner = address(0);
+                userPermission = false;
+            }
+        } else {
+            escrowOwner = address(0);
+            userPermission = false;
+        }
+    }
+
+    /// ========== Emergency Functions ==========
+    /// @notice emergency: revoke all bot permissions for a user (called by user)
+    function emergencyRevokeBotPermissions(address[] calldata bots) external {
+        require(bots.length > 0, "EscrowManager: empty bots array");
+        for (uint256 i = 0; i < bots.length; i++) {
+            userBotPermissions[msg.sender][bots[i]] = false;
+            emit BotPermissionGranted(msg.sender, bots[i], false);
+        }
+    }
+
+    /// @notice emergency: disable entire bot system (only owner)
+    function emergencyDisableBotSystem() external onlyOwner {
+        botSystemEnabled = false;
+    }
+
+    /// ========== TVL Functions (unchanged) ==========
+    // ... (rest of the TVL functions remain the same as original)
+
+    /// ========== Utility Functions ==========
+    /// @notice convert address to string for error messages
+    function addressToString(address addr) internal pure returns (string memory) {
+        bytes32 value = bytes32(uint256(uint160(addr)));
+        bytes memory alphabet = "0123456789abcdef";
+        bytes memory str = new bytes(42);
+        str[0] = '0';
+        str[1] = 'x';
+        for (uint256 i = 0; i < 20; i++) {
+            str[2 + i * 2] = alphabet[uint8(value[i + 12] >> 4)];
+            str[3 + i * 2] = alphabet[uint8(value[i + 12] & 0x0f)];
+        }
+        return string(str);
+    }
+
+    /// @notice convert uint256 to string for error messages
+    function uint256ToString(uint256 value) internal pure returns (string memory) {
+        if (value == 0) return "0";
+        uint256 temp = value;
+        uint256 digits;
+        while (temp != 0) {
+            digits++;
+            temp /= 10;
+        }
+        bytes memory buffer = new bytes(digits);
+        while (value != 0) {
+            digits -= 1;
+            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
+            value /= 10;
+        }
+        return string(buffer);
+    }
+}
